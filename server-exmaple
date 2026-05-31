@@ -1,0 +1,275 @@
+const express = require('express');
+const app = express();
+const http = require('http').createServer(app);
+const io = require('socket.io')(http, {
+  cors: {
+    origin: "*",
+    methods: ["GET", "POST"]
+  }
+});
+
+// Supabase client for database operations
+const { createClient } = require('@supabase/supabase-js');
+const supabaseUrl = 'https://qliuiivoigeeavpdoamu.supabase.co';
+const supabaseKey = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InFsaXVpaXZvaWdlZWF2cGRvYW11Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzMwMTI2ODEsImV4cCI6MjA4ODU4ODY4MX0.M5wPbu7Y9SWmu3aY6UqVHs57QPchPK9wV8sCHoCiN3w';
+const supabase = createClient(supabaseUrl, supabaseKey);
+
+// Store all connected players
+const players = {};
+
+// AVM spawn configuration
+const AVM_CONFIG = {
+  SPAWN_INTERVAL: 120000, // 2 minutes
+  VALUE_MIN: 10,
+  VALUE_MAX: 50,
+  WORLD_GRID_SIZE: 100
+};
+
+// Store active AVM pickups in memory
+const avmPickups = {};
+
+// AVM spawn function
+function spawnAvm() {
+  const gridSize = AVM_CONFIG.WORLD_GRID_SIZE;
+  
+  // Find valid spawn position
+  let validPos = false;
+  let avmX, avmY;
+  let attempts = 0;
+  
+  while (!validPos && attempts < 50) {
+    avmX = Math.floor(Math.random() * (gridSize - 6)) + 3;
+    avmY = Math.floor(Math.random() * (gridSize - 6)) + 3;
+    
+    // Check not too close to any player
+    let tooClose = false;
+    for (const playerId in players) {
+      const player = players[playerId];
+      const playerGridX = Math.floor(player.x / 64);
+      const playerGridY = Math.floor(player.y / 64);
+      const dist = Math.abs(avmX - playerGridX) + Math.abs(avmY - playerGridY);
+      if (dist < 4) {
+        tooClose = true;
+        break;
+      }
+    }
+    
+    if (!tooClose) {
+      validPos = true;
+    }
+    attempts++;
+  }
+  
+  if (!validPos) return;
+  
+  // Generate random value
+  const value = Math.floor(Math.random() * (AVM_CONFIG.VALUE_MAX - AVM_CONFIG.VALUE_MIN + 1)) + AVM_CONFIG.VALUE_MIN;
+  
+  // Create pickup ID
+  const pickupId = `avm_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+  
+  // Store pickup
+  avmPickups[pickupId] = {
+    id: pickupId,
+    gridX: avmX,
+    gridY: avmY,
+    value: value,
+    spawnedAt: Date.now()
+  };
+  
+  // Broadcast to all clients
+  io.emit('avmSpawned', {
+    id: pickupId,
+    gridX: avmX,
+    gridY: avmY,
+    value: value
+  });
+  
+  console.log(`AVM spawned at (${avmX}, ${avmY}) with value ${value}`);
+  
+  // Store in Supabase
+  supabase.from('avm_pickups').insert({
+    grid_x: avmX,
+    grid_y: avmY,
+    value: value
+  }).catch(err => console.error('Failed to store AVM pickup in database:', err));
+}
+
+// Start AVM spawn timer
+let avmSpawnTimer = setInterval(spawnAvm, AVM_CONFIG.SPAWN_INTERVAL);
+
+// Spawn first AVM after 30 seconds
+setTimeout(spawnAvm, 30000);
+
+// When a client connects
+io.on('connection', (socket) => {
+  console.log('Player connected:', socket.id);
+  
+  // Add new player to our players object
+  players[socket.id] = {
+    id: socket.id,
+    x: 400,  // Starting position (center of map)
+    y: 400
+  };
+  
+  // Tell the new player about all existing players
+  socket.emit('currentPlayers', players);
+  
+  // Tell all OTHER players about the new player
+  socket.broadcast.emit('playerJoined', {
+    id: socket.id,
+    x: players[socket.id].x,
+    y: players[socket.id].y
+  });
+  
+  // Send current AVM pickups to new player
+  socket.emit('currentAvmPickups', avmPickups);
+  
+  // Get or create player balance from Supabase
+  supabase.from('player_balances').upsert({
+    socket_id: socket.id,
+    avm_balance: 0
+  }, {
+    onConflict: 'socket_id'
+  }).then(({ data, error }) => {
+    if (error) {
+      console.error('Failed to create player balance:', error);
+    } else {
+      console.log('Player balance initialized for:', socket.id);
+    }
+  });
+  
+  // When a player moves
+  socket.on('playerMove', (data) => {
+    // Update player position in our server data
+    if (players[socket.id]) {
+      players[socket.id].x = data.x;
+      players[socket.id].y = data.y;
+      
+      // Broadcast to all OTHER players
+      socket.broadcast.emit('playerMoved', {
+        id: socket.id,
+        x: data.x,
+        y: data.y
+      });
+      
+      console.log('Player moved:', socket.id, data.x, data.y);
+    }
+  });
+  
+  // When a player disconnects
+  socket.on('disconnect', () => {
+    console.log('Player disconnected:', socket.id);
+    
+    // Remove from players object
+    delete players[socket.id];
+    
+    // Tell all other players this player left
+    socket.broadcast.emit('playerLeft', socket.id);
+  });
+  
+  // When a player requests to pick up AVM
+  socket.on('avmPickup', async (data) => {
+    const { pickupId, playerGridX, playerGridY } = data;
+    
+    // Validate pickup exists
+    if (!avmPickups[pickupId]) {
+      socket.emit('avmPickupFailed', { reason: 'Pickup not found' });
+      return;
+    }
+    
+    const pickup = avmPickups[pickupId];
+    
+    // Validate player is close to pickup (within 2 tiles)
+    const dist = Math.abs(pickup.gridX - playerGridX) + Math.abs(pickup.gridY - playerGridY);
+    if (dist > 2) {
+      socket.emit('avmPickupFailed', { reason: 'Too far from pickup' });
+      return;
+    }
+    
+    // Award AVM to player
+    try {
+      const { data: balanceData, error: balanceError } = await supabase
+        .from('player_balances')
+        .select('avm_balance')
+        .eq('socket_id', socket.id)
+        .single();
+      
+      if (balanceError || !balanceData) {
+        socket.emit('avmPickupFailed', { reason: 'Balance not found' });
+        return;
+      }
+      
+      const newBalance = balanceData.avm_balance + pickup.value;
+      
+      const { error: updateError } = await supabase
+        .from('player_balances')
+        .update({ 
+          avm_balance: newBalance,
+          last_updated: new Date().toISOString()
+        })
+        .eq('socket_id', socket.id);
+      
+      if (updateError) {
+        socket.emit('avmPickupFailed', { reason: 'Failed to update balance' });
+        return;
+      }
+      
+      // Remove pickup from memory
+      delete avmPickups[pickupId];
+      
+      // Broadcast to all clients that pickup was collected
+      io.emit('avmCollected', {
+        pickupId: pickupId,
+        collectedBy: socket.id
+      });
+      
+      // Send updated balance to player
+      socket.emit('avmBalanceUpdated', { balance: newBalance });
+      
+      console.log(`Player ${socket.id} collected AVM ${pickup.value} at (${pickup.gridX}, ${pickup.gridY}). New balance: ${newBalance}`);
+      
+      // Mark pickup as collected in database
+      await supabase
+        .from('avm_pickups')
+        .update({ 
+          collected_at: new Date().toISOString(),
+          collected_by: socket.id 
+        })
+        .eq('grid_x', pickup.gridX)
+        .eq('grid_y', pickup.gridY)
+        .is('collected_at', null);
+      
+    } catch (error) {
+      console.error('Error processing AVM pickup:', error);
+      socket.emit('avmPickupFailed', { reason: 'Server error' });
+    }
+  });
+  
+  // When a player requests their current balance
+  socket.on('getAvmBalance', async () => {
+    try {
+      const { data, error } = await supabase
+        .from('player_balances')
+        .select('avm_balance')
+        .eq('socket_id', socket.id)
+        .single();
+      
+      if (error || !data) {
+        socket.emit('avmBalanceUpdated', { balance: 0 });
+      } else {
+        socket.emit('avmBalanceUpdated', { balance: data.avm_balance });
+      }
+    } catch (error) {
+      console.error('Error getting AVM balance:', error);
+      socket.emit('avmBalanceUpdated', { balance: 0 });
+    }
+  });
+});
+
+// Start server
+const PORT = 3000;
+http.listen(PORT, () => {
+  console.log(`LENEXUS Multiplayer Server running on port ${PORT}`);
+  console.log(`Server address: ws://localhost:${PORT}`);
+});
